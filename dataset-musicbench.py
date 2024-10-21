@@ -8,8 +8,9 @@ import torchaudio # type: ignore
 from load_wavtokenizer import load_wavtokenizer
 wavtokenizer = load_wavtokenizer()
 
-dataset_dir = "/tmp/dataset-musicbench-files"
+dataset_dir = "/workspace/data/dataset-musicbench-files"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 
 
@@ -17,14 +18,18 @@ def download_musicbench():
     # seems like we need to manually download the dataset as the original authors have uploaded it zipped
     url = "https://huggingface.co/datasets/amaai-lab/MusicBench/resolve/main/MusicBench.tar.gz?download=true"
     
+    os.makedirs(dataset_dir, exist_ok=True)
+    
     # skip if already downloaded
     if os.path.exists(f"{dataset_dir}/MusicBench.tar.gz"):
         print("Dataset already downloaded")
-        return
+    else:
+        os.system(f"curl -L {url} -o {dataset_dir}/MusicBench.tar.gz")
     
-    os.makedirs(dataset_dir, exist_ok=True)
-    os.system(f"curl -L {url} -o {dataset_dir}/MusicBench.tar.gz")
-    os.system(f"tar -xzf {dataset_dir}/MusicBench.tar.gz -C {dataset_dir}")
+    if os.path.exists(f"{dataset_dir}/datashare"):
+        print("Dataset already extracted")
+    else:
+        os.system(f"tar -xzf {dataset_dir}/MusicBench.tar.gz -C {dataset_dir}")
 
 def preprocess_function(examples, wavtokenizer=wavtokenizer):
     wavtokenizer_tokens = []
@@ -38,7 +43,7 @@ def preprocess_function(examples, wavtokenizer=wavtokenizer):
         
         # Encode the audio to tokens
         with torch.no_grad():
-            features, _ = wavtokenizer.encode_infer(wav, bandwidth_id=torch.tensor([0]))
+            features, _ = wavtokenizer.encode_infer(wav, bandwidth_id=torch.tensor([0], device=device))
         
         wavtokenizer_tokens.append(features.cpu().numpy())
         processed_captions.append(examples['main_caption'][i])
@@ -64,7 +69,7 @@ def load_musicbench(num_examples=None):
     processed_dataset = dataset.map(
         preprocess_function,
         batched=True,
-        batch_size=16,  # Adjust this based on your memory constraints
+        batch_size=256,  # Adjust this based on your memory constraints
         remove_columns=dataset['train'].column_names,
         desc="Processing audio files"
     )
@@ -74,7 +79,7 @@ def load_musicbench(num_examples=None):
 
 if __name__ == "__main__":
     download_musicbench()
-    # processed_dataset = load_musicbench(10)  # Process only the first 100 examples of each split
+    # processed_dataset = load_musicbench(1)  # Process only the first 100 examples of each split
     # for split in processed_dataset.keys():
     #     print(f"Number of processed examples in {split}:", len(processed_dataset[split]))
     # print("Sample processed example:", processed_dataset['train'][0].keys())
