@@ -12,7 +12,7 @@ tensorboardX==2.6
 soundfile==0.12.1
 numpy==1.23.5
 jsonargparse[signatures]>=4.15.2
-fairseq
+fairseq==0.12.2
 torchcrepe
 librosa
 pesq
