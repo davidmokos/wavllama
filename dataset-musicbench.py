@@ -8,7 +8,7 @@ import torchaudio # type: ignore
 from load_wavtokenizer import load_wavtokenizer
 wavtokenizer = load_wavtokenizer()
 
-dataset_dir = "/workspace/data/dataset-musicbench-files"
+dataset_dir = "/tmp/dataset-musicbench-files"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -69,7 +69,7 @@ def load_musicbench(num_examples=None):
     processed_dataset = dataset.map(
         preprocess_function,
         batched=True,
-        batch_size=256,  # Adjust this based on your memory constraints
+        batch_size=8,  # Adjust this based on your memory constraints
         remove_columns=dataset['train'].column_names,
         desc="Processing audio files"
     )

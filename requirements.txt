@@ -1,2 +1,31 @@
+# numba
+# librosa
+
+torch==2.5.0
+torchaudio==2.5.0
+scipy==1.14.1
+einops==0.8.0
+pyyaml==6.0.2
+huggingface_hub==0.26.1
+encodec==0.1.1
+matplotlib==3.9.2
+transformers==4.46.0
+pytorch-lightning==2.4.0
+tensorboardX==2.6
+soundfile==0.12.1
+numpy==2.0.2
+jsonargparse[signatures]>=4.15.2
+fairseq==0.12.2
+torchcrepe==0.0.23
+numba==0.60.0
+librosa
+pesq
+
+
 datasets
-transformers
+# transformers
+wandb
+tqdm
+# torch
+# torchaudio
+modal
