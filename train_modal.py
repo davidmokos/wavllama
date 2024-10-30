@@ -50,12 +50,12 @@ def some_func():
     print(os.listdir("/my_vol"))
 
 
-@app.function(volumes={"/my_vol": vol})
+@app.function(volumes={"/my_vol": vol}, timeout=2*3600)
 def download_wavtokenizer_model():
     model_id = "novateur/WavTokenizer-medium-music-audio-75token"
     from huggingface_hub import snapshot_download  # type: ignore
     model_dir = snapshot_download(
-        repo_id=model_id, local_dir="/my_vol/wavtokenizer")
+        repo_id=model_id, cache_dir="/my_vol/wavtokenizer")
     print(f"Model downloaded to {model_dir}")
 
 
@@ -76,8 +76,33 @@ def load_wavtokenizer():
 @app.function(volumes={"/my_vol": vol}, mounts=[modal.Mount.from_local_dir("./WavTokenizer", remote_path="/root/WavTokenizer")])
 def check_wavtokenizer_model():
     load_wavtokenizer()
+    
+    
+    
+@app.function(
+    volumes={"/my_vol": vol},
+    mounts=[modal.Mount.from_local_dir("./WavTokenizer", remote_path="/root/WavTokenizer"),
+            modal.Mount.from_local_dir("./examples", remote_path="/root/examples")]
+)
+def train_wavllama():
+    pass
+
+
+@app.function(volumes={"/my_vol": vol}, secrets=[modal.Secret.from_name("huggingface-secret-david")], timeout=2*3600)
+def download_llama_model():
+    from transformers import AutoTokenizer, AutoModelForCausalLM # type: ignore
+    # from transformers.utils import move_cache
+
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B", token=os.environ["HF_TOKEN"], cache_dir="/my_vol/llama")
+    model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B", token=os.environ["HF_TOKEN"], cache_dir="/my_vol/llama")
+    
+    print(tokenizer)
+    print(model)
+
+
 
 
 @app.local_entrypoint()
 def main():
-    some_func.remote()
+    download_llama_model.remote()
+    # download_wavtokenizer_model.remote()
