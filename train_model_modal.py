@@ -1,12 +1,19 @@
+import modal
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset
-from tqdm import tqdm
 import wandb
-import numpy as np
+from tqdm import tqdm
+import os
+import sys
+
+# Define the Modal volume and app
+vol = modal.Volume.from_name("wavllama-volume", create_if_missing=True)
+image = modal.Image.debian_slim(python_version="3.12") \
+    .pip_install_from_requirements("requirements.txt") \
+
+app = modal.App("wavllama-training", image=image)
 
 class TextAudioDataset(Dataset):
     def __init__(self, hf_dataset, tokenizer, max_length=512):
@@ -20,7 +27,6 @@ class TextAudioDataset(Dataset):
     def __getitem__(self, idx):
         item = self.dataset[idx]
         
-        # Tokenize text
         text_tokens = self.tokenizer(
             item['main_caption'], 
             padding="max_length", 
@@ -29,7 +35,6 @@ class TextAudioDataset(Dataset):
             return_tensors="pt"
         )
         
-        # Convert wavtokenizer tokens to tensor
         audio_tokens = torch.tensor(item['wavtokenizer_tokens'])
         
         return {
@@ -39,28 +44,35 @@ class TextAudioDataset(Dataset):
         }
 
 class TextToAudioModel(nn.Module):
-    def __init__(self, llama_model_name, wav_tokenizer_vocab_size):
+    def __init__(self, llama_model, wav_tokenizer_vocab_size, num_trainable_layers=4):
         super().__init__()
         
-        # Load the Llama 3 model
-        self.llama_model = AutoModelForCausalLM.from_pretrained(llama_model_name)
+        self.llama_model = llama_model
         
-        # Freeze all layers except the last one
+        # Count total parameters and freeze all initially
         total_params = 0
-        trainable_params = 0
-        for name, param in self.llama_model.named_parameters():
+        for param in self.llama_model.parameters():
             total_params += param.numel()
-            if "layers.-1." not in name:  # Not the last layer
-                param.requires_grad = False
-            else:
+            param.requires_grad = False
+        
+        # Unfreeze the last n transformer layers
+        trainable_params = 0
+        for i in range(num_trainable_layers):
+            layer_idx = len(self.llama_model.model.layers) - 1 - i
+            for param in self.llama_model.model.layers[layer_idx].parameters():
                 param.requires_grad = True
                 trainable_params += param.numel()
+        
+        # Also unfreeze the output projection layers
+        for param in self.llama_model.lm_head.parameters():
+            param.requires_grad = True
+            trainable_params += param.numel()
         
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
         print(f"Percentage of trainable parameters: {100 * trainable_params / total_params:.2f}%")
         
-        # Add new layers
+        # Add new layers for audio token prediction
         self.projection = nn.Linear(self.llama_model.config.hidden_size, wav_tokenizer_vocab_size)
         self.layer_norm = nn.LayerNorm(wav_tokenizer_vocab_size)
         
@@ -86,15 +98,12 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
         loss = criterion(outputs.view(-1, outputs.size(-1)), audio_tokens.view(-1))
         loss.backward()
         
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
         optimizer.step()
         
         total_loss += loss.item()
         current_loss = loss.item()
         
-        # Log metrics
         wandb.log({
             "batch_loss": current_loss,
             "epoch": epoch,
@@ -102,7 +111,6 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
             "global_step": epoch * len(dataloader) + batch_idx
         })
         
-        # Update progress bar
         progress_bar.set_postfix({
             'loss': f"{current_loss:.4f}",
             'avg_loss': f"{total_loss / (batch_idx + 1):.4f}"
@@ -126,17 +134,26 @@ def validate(model, dataloader, criterion, device):
     
     return total_loss / len(dataloader)
 
-def main():
+@app.function(
+    volumes={"/my_vol": vol},
+    mounts=[modal.Mount.from_local_dir("./WavTokenizer", remote_path="/root/WavTokenizer")],
+    gpu="h100",
+    timeout=24*3600,  # 24 hours
+    secrets=[modal.Secret.from_name("david-wandb-secret"), modal.Secret.from_name("huggingface-secret-david")],
+    # retries=modal.Retries(max_retries=10, initial_delay=0.0)
+)
+def train_wavllama():
     # Initialize wandb
     wandb.init(
-        project="text-to-audio-llama",
+        project="wavllama",
         config={
             "architecture": "Llama-3-8B + WavTokenizer",
             "dataset": "musicbench-processed",
             "learning_rate": 1e-4,
             "batch_size": 8,
             "epochs": 10,
-            "max_length": 512
+            "max_length": 512,
+            "trainable_layers": 4
         }
     )
     
@@ -144,63 +161,56 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load dataset
-    dataset = load_dataset("davidmokos/musicbench-processed")
-    
-    # Create train/val split
+    # Load dataset from cache
+    from datasets import load_dataset # type: ignore
+    dataset = load_dataset("davidmokos/musicbench-processed", cache_dir="/my_vol/musicbench")
     dataset = dataset['train'].train_test_split(test_size=0.1)
-    train_dataset = dataset['train']
-    val_dataset = dataset['test']
+    
+    # Load models from cache
+    from transformers import AutoTokenizer, AutoModelForCausalLM # type: ignore
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B", cache_dir="/my_vol/llama")
+    tokenizer.pad_token = tokenizer.eos_token  # Use the end-of-sequence token as padding
+    tokenizer.padding_side = "right"  # Pad on the right side of the sequence
+    llama_model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B", cache_dir="/my_vol/llama")
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+    # Load WavTokenizer
+    sys.path.insert(0, "/root/WavTokenizer")
+    from decoder.pretrained import WavTokenizer
+    model_path = "/my_vol/wavtokenizer/wavtokenizer_medium_music_audio_320_24k_v2.ckpt"
+    config_path = "/root/WavTokenizer/configs/wavtokenizer_mediumdata_music_audio_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml"
+    wavtokenizer = WavTokenizer.from_pretrained0802(config_path, model_path)
+    wav_tokenizer_vocab_size = 4096  # Adjust if needed
 
     # Create dataloaders
-    train_dataset = TextAudioDataset(train_dataset, tokenizer, wandb.config.max_length)
-    val_dataset = TextAudioDataset(val_dataset, tokenizer, wandb.config.max_length)
+    train_dataset = TextAudioDataset(dataset['train'], tokenizer, wandb.config.max_length)
+    val_dataset = TextAudioDataset(dataset['test'], tokenizer, wandb.config.max_length)
     
-    train_dataloader = DataLoader(
-        train_dataset, 
-        batch_size=wandb.config.batch_size, 
-        shuffle=True,
-        num_workers=4
-    )
-    val_dataloader = DataLoader(
-        val_dataset, 
-        batch_size=wandb.config.batch_size, 
-        shuffle=False,
-        num_workers=4
-    )
+    train_dataloader = DataLoader(train_dataset, batch_size=wandb.config.batch_size, shuffle=True, num_workers=4)
+    val_dataloader = DataLoader(val_dataset, batch_size=wandb.config.batch_size, shuffle=False, num_workers=4)
 
     # Initialize model
     model = TextToAudioModel(
-        "meta-llama/Meta-Llama-3-8B-Instruct",
-        wav_tokenizer_vocab_size=4096  # Adjust if needed
+        llama_model,
+        wav_tokenizer_vocab_size=wav_tokenizer_vocab_size,
+        num_trainable_layers=wandb.config.trainable_layers
     ).to(device)
     
-    # Log model architecture
     wandb.watch(model, log_freq=100)
 
-    # Set up optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=wandb.config.learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
-    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
     criterion = nn.CrossEntropyLoss()
 
-    # Training loop
+    # Training loop with checkpointing
     best_val_loss = float('inf')
+    checkpoint_path = "/my_vol/checkpoints"
+    os.makedirs(checkpoint_path, exist_ok=True)
+    
     for epoch in range(wandb.config.epochs):
-        # Train
         train_loss = train_epoch(model, train_dataloader, optimizer, criterion, device, epoch)
-        
-        # Validate
         val_loss = validate(model, val_dataloader, criterion, device)
-        
-        # Update learning rate
         scheduler.step(val_loss)
         
-        # Log metrics
         wandb.log({
             "train_loss": train_loss,
             "val_loss": val_loss,
@@ -208,17 +218,24 @@ def main():
             "learning_rate": optimizer.param_groups[0]['lr']
         })
         
-        # Save best model
+        # Save checkpoint
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+        }
+        
+        checkpoint_file = os.path.join(checkpoint_path, f"checkpoint_epoch_{epoch}.pt")
+        torch.save(checkpoint, checkpoint_file)
+        
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-            }, "best_model.pth")
-            wandb.save("best_model.pth")
+            best_model_path = os.path.join(checkpoint_path, "best_model.pt")
+            torch.save(checkpoint, best_model_path)
+            wandb.save(best_model_path)
         
         print(f"Epoch {epoch+1}/{wandb.config.epochs}")
         print(f"Train Loss: {train_loss:.4f}")
@@ -226,5 +243,6 @@ def main():
     
     wandb.finish()
 
-if __name__ == "__main__":
-    main()
+@app.local_entrypoint()
+def main():
+    train_wavllama.remote()

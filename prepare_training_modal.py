@@ -3,6 +3,7 @@ import os
 import torch
 import torchaudio  # type: ignore
 import sys
+import datasets  # type: ignore
 
 
 image = modal.Image.debian_slim(python_version="3.12") \
@@ -10,7 +11,7 @@ image = modal.Image.debian_slim(python_version="3.12") \
 
 
 app = modal.App("example-long-training-lightning", image=image)
-vol = modal.Volume.from_name("wavllama-volume")
+vol = modal.Volume.from_name("wavllama-volume", create_if_missing=True)
 
 
 @app.function(
@@ -18,9 +19,9 @@ vol = modal.Volume.from_name("wavllama-volume")
     mounts=[modal.Mount.from_local_dir("./WavTokenizer", remote_path="/root/WavTokenizer"),
             modal.Mount.from_local_dir("./examples", remote_path="/root/examples")]
 )
-def some_func():
+def try_wavtokenizer_inference():
 
-    wavtokenizer = load_wavtokenizer()
+    wavtokenizer = load_wavtokenizer_model()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -59,50 +60,56 @@ def download_wavtokenizer_model():
     print(f"Model downloaded to {model_dir}")
 
 
-def load_wavtokenizer():
+def load_wavtokenizer_model():
     model_path = "/my_vol/wavtokenizer/wavtokenizer_medium_music_audio_320_24k_v2.ckpt"
     config_path = "/root/WavTokenizer/configs/wavtokenizer_mediumdata_music_audio_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     sys.path.insert(0, "/root/WavTokenizer")
     from decoder.pretrained import WavTokenizer
-    
+
     wavtokenizer = WavTokenizer.from_pretrained0802(config_path, model_path)
     wavtokenizer = wavtokenizer.to(device)
 
     return wavtokenizer
 
 
-@app.function(volumes={"/my_vol": vol}, mounts=[modal.Mount.from_local_dir("./WavTokenizer", remote_path="/root/WavTokenizer")])
-def check_wavtokenizer_model():
-    load_wavtokenizer()
-    
-    
-    
-@app.function(
-    volumes={"/my_vol": vol},
-    mounts=[modal.Mount.from_local_dir("./WavTokenizer", remote_path="/root/WavTokenizer"),
-            modal.Mount.from_local_dir("./examples", remote_path="/root/examples")]
-)
-def train_wavllama():
-    pass
+@app.function(volumes={"/my_vol": vol}, secrets=[modal.Secret.from_name("huggingface-secret-david")], timeout=2*3600)
+def download_or_load_llama_model():
+    from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        "meta-llama/Meta-Llama-3-8B", token=os.environ["HF_TOKEN"], cache_dir="/my_vol/llama")
+    model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Meta-Llama-3-8B", token=os.environ["HF_TOKEN"], cache_dir="/my_vol/llama")
+
+    # print(tokenizer)
+    # print(model)
+
+    return tokenizer, model
 
 
 @app.function(volumes={"/my_vol": vol}, secrets=[modal.Secret.from_name("huggingface-secret-david")], timeout=2*3600)
-def download_llama_model():
-    from transformers import AutoTokenizer, AutoModelForCausalLM # type: ignore
-    # from transformers.utils import move_cache
+def download_or_load_dataset():
 
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B", token=os.environ["HF_TOKEN"], cache_dir="/my_vol/llama")
-    model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B", token=os.environ["HF_TOKEN"], cache_dir="/my_vol/llama")
+    dataset = datasets.load_dataset(
+        "davidmokos/musicbench-processed", cache_dir="/my_vol/musicbench")
+    print(dataset)
     
-    print(tokenizer)
-    print(model)
-
+    # print(dataset.features)
+    
+    # print(dataset["train"][0])
+    # print(dataset["train"][0]["wavtokenizer_tokens"])
+    # t = torch.tensor(dataset["train"][0]["wavtokenizer_tokens"])
+    # print(t)
+    
+    for i in range(10):
+        print(torch.tensor(dataset["train"][i]["wavtokenizer_tokens"]).shape)
 
 
 
 @app.local_entrypoint()
 def main():
-    download_llama_model.remote()
+    # download_or_load_llama_model.remote()
     # download_wavtokenizer_model.remote()
+    download_or_load_dataset.remote()
