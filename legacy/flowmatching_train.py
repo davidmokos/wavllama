@@ -11,7 +11,6 @@ from datasets import load_dataset  # type: ignore
 import wandb
 from einops import rearrange, repeat
 import math
-from tqdm import tqdm
 
 # Define Modal setup
 vol = modal.Volume.from_name("wavllama-volume", create_if_missing=True)
@@ -108,8 +107,8 @@ class MusicFlowMatching(nn.Module):
         self.pos_embedding = nn.Parameter(
             torch.randn(1, sequence_length, hidden_dim))
 
-        # Initial projection for noise
-        self.noise_projection = nn.Linear(1, hidden_dim)
+        # Initial projection for input x_t
+        self.input_projection = nn.Linear(1, hidden_dim)
 
         # Flow layers
         self.layers = nn.ModuleList([
@@ -120,19 +119,19 @@ class MusicFlowMatching(nn.Module):
         # Final velocity prediction
         self.to_velocity = nn.Linear(hidden_dim, 1)
 
-    def forward(self, noise, time, text_ids, attention_mask):
+    def forward(self, x_t, time, text_ids, attention_mask):
         # Get text embeddings from BERT
         with torch.no_grad():
             text_features = self.bert(
-                text_ids, attention_mask=attention_mask)[0]
+                text_ids, attention_mask=attention_mask).last_hidden_state
         text_features = self.text_projection(text_features)
 
         # Time embedding
         t_emb = self.time_embedding(time)
-        t_emb = repeat(t_emb, 'b d -> b n d', n=noise.shape[1])
+        t_emb = repeat(t_emb, 'b d -> b n d', n=x_t.shape[1])
 
-        # Project noise and add position embedding
-        x = self.noise_projection(noise.unsqueeze(-1))
+        # Project x_t and add position embedding and time embedding
+        x = self.input_projection(x_t.unsqueeze(-1))
         x = x + self.pos_embedding + t_emb
 
         # Flow layers
@@ -143,9 +142,11 @@ class MusicFlowMatching(nn.Module):
         velocity = self.to_velocity(x).squeeze(-1)
         return velocity
 
-    def get_velocity(self, x0, x1, t):
-        """Calculate target velocity given two points and time"""
-        return (x1 - x0) / t
+    def get_velocity(self, x_t, x1, t):
+        """Calculate target velocity given current x_t, target x1, and time t"""
+        epsilon = 1e-5  # Small constant to prevent division by zero
+        denom = (1 - t[:, None] + epsilon)
+        return (x1 - x_t) / denom
 
 
 class MusicDataset(Dataset):
@@ -214,16 +215,25 @@ class MusicFlowMatchingLightning(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
-        target_tokens = batch['wav_tokens']
+        target_tokens = batch['wav_tokens'].float()  # Ensure float type
 
-        t = torch.rand(input_ids.shape[0], device=self.device)
+        batch_size = input_ids.shape[0]
+
+        t = torch.rand(batch_size, device=self.device)
+        t = t * 0.9999  # Ensure t < 1 to avoid division by zero
+
         noise = torch.randn_like(target_tokens, device=self.device)
 
+        # Reshape t for broadcasting
         t_expanded = t[:, None]
-        x_t = t_expanded * target_tokens + (1 - t_expanded) * noise
 
-        target_velocity = self.model.get_velocity(
-            noise, target_tokens, t_expanded)
+        # Compute x_t
+        x_t = (1 - t_expanded) * noise + t_expanded * target_tokens
+
+        # Compute target velocity
+        target_velocity = self.model.get_velocity(x_t, target_tokens, t)
+
+        # Model prediction
         predicted_velocity = self.model(x_t, t, input_ids, attention_mask)
 
         loss = F.mse_loss(predicted_velocity, target_velocity)
@@ -241,16 +251,25 @@ class MusicFlowMatchingLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
-        target_tokens = batch['wav_tokens']
+        target_tokens = batch['wav_tokens'].float()  # Ensure float type
 
-        t = torch.rand(input_ids.shape[0], device=self.device)
+        batch_size = input_ids.shape[0]
+
+        t = torch.rand(batch_size, device=self.device)
+        t = t * 0.9999  # Ensure t < 1 to avoid division by zero
+
         noise = torch.randn_like(target_tokens, device=self.device)
 
+        # Reshape t for broadcasting
         t_expanded = t[:, None]
-        x_t = t_expanded * target_tokens + (1 - t_expanded) * noise
 
-        target_velocity = self.model.get_velocity(
-            noise, target_tokens, t_expanded)
+        # Compute x_t
+        x_t = (1 - t_expanded) * noise + t_expanded * target_tokens
+
+        # Compute target velocity
+        target_velocity = self.model.get_velocity(x_t, target_tokens, t)
+
+        # Model prediction
         predicted_velocity = self.model(x_t, t, input_ids, attention_mask)
 
         loss = F.mse_loss(predicted_velocity, target_velocity)
@@ -281,11 +300,10 @@ class MusicFlowMatchingLightning(pl.LightningModule):
 
 @app.function(
     volumes={"/my_vol": vol},
-    gpu="h100",
+    gpu="any",  # Use "any" if specific GPU type is not required
     timeout=24*3600,
     secrets=[modal.Secret.from_name(
         "david-wandb-secret"), modal.Secret.from_name("huggingface-secret-david")],
-    # retries=modal.Retries(max_retries=10, initial_delay=0.0)
 )
 def train():
     config = {
@@ -293,10 +311,10 @@ def train():
         "hidden_dim": 256,
         "num_layers": 4,
         "batch_size": 32,
-        "learning_rate": 1e-5,
-        "num_epochs": 100,
+        "learning_rate": 1e-4,  # Increased learning rate for faster convergence
+        "num_epochs": 10,       # Reduced epochs for MVP run
         "sequence_length": 150,
-        "max_text_length": 512
+        "max_text_length": 128  # Reduced max text length for efficiency
     }
 
     wandb_logger = WandbLogger(project="music-flow-matching", config=config)
@@ -352,7 +370,7 @@ def train():
 
     early_stopping = EarlyStopping(
         monitor='val_loss',
-        patience=10,
+        patience=3,  # Reduced patience for MVP
         mode='min'
     )
 
@@ -363,10 +381,9 @@ def train():
         logger=wandb_logger,
         callbacks=[checkpoint_callback, early_stopping],
         default_root_dir="/my_vol/lightning_logs",
-        # gradient_clip_val=1.0,
-        gradient_clip_val=0.5,  # Lower clip value
+        gradient_clip_val=0.5,
         gradient_clip_algorithm="norm",
-        # precision="16-mixed",  # Add mixed precision training (crashes)
+        # precision=16,  # Uncomment if mixed precision is desired and stable
     )
 
     try:
