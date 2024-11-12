@@ -5,6 +5,8 @@ import torch
 import torchaudio  # type: ignore
 import sys
 import datasets  # type: ignore
+from tqdm import tqdm
+import numpy as np
 
 
 image = modal.Image.debian_slim(python_version="3.12") \
@@ -239,10 +241,68 @@ def preprocess_wavtokenizer():
 
     processed_dataset.push_to_hub("davidmokos/musicbench-wavtokenizer")
     
+@app.function(
+    volumes={"/my_vol": vol},
+    mounts=mounts,
+    timeout=16*3600, 
+    secrets=[modal.Secret.from_name("huggingface-secret-david")],
+    )
+def preprocess_get_gpt2_dataset():
+    num_proc = 8
+    dataset = datasets.load_dataset("davidmokos/musicbench-wavtokenizer", cache_dir="/my_vol/hf_cache", num_proc=num_proc)
+    
+    split_dataset = dataset["train"].train_test_split(test_size=0.01, seed=2357, shuffle=True)
+    split_dataset['val'] = split_dataset.pop('test') # rename the test split to val
+    
+    print(split_dataset)
+    
+    def process(example):
+        ids = example['discrete_codes']
+        # it's either torch.Size([1, 2, audio_length]) or torch.Size([1, 1, audio_length])
+        # something like 
+        # tensor([[[4062, 1269,  753,  ..., 3655,  270, 2662],
+        #          [4062, 1293, 1462,  ..., 1400, 3880, 2662]]])
+        # we want to only take the first one
+        ids = list(ids[0][0])
+        
+        ids.append(4096) # add the end of text token ???
+        print(ids)
+        out = {'ids': ids, 'len': len(ids)}
+        return out
 
+    # tokenize the dataset
+    tokenized = split_dataset.map(
+        process,
+        remove_columns=split_dataset['train'].column_names,
+        desc="tokenizing the splits",
+        num_proc=num_proc,
+    )
+        
+    # concatenate all the ids in each dataset into one large file we can use for training
+    for split, dset in tokenized.items():
+        arr_len = np.sum(dset['len'], dtype=np.uint64)
+        dir_name = "/my_vol/musicbench-gpt2"
+        os.makedirs(dir_name, exist_ok=True)
+        filename = os.path.join(dir_name, f'{split}.bin')
+        dtype = np.uint16 # (can do since vocab size is 4096)
+        arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
+        total_batches = 1024
+
+        idx = 0
+        for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
+            # Batch together samples for faster write
+            batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
+            arr_batch = np.concatenate(batch['ids'])
+            # Write into mmap
+            arr[idx : idx + len(arr_batch)] = arr_batch
+            idx += len(arr_batch)
+        arr.flush()
+    
+    
 
 @app.local_entrypoint()
 def main():
     # download_dataset.remote()
     # test_wavtokenizer_model.remote()
-    preprocess_wavtokenizer.remote()
+    # preprocess_wavtokenizer.remote()
+    preprocess_get_gpt2_dataset.remote()
