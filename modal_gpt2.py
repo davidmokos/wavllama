@@ -44,9 +44,9 @@ def train_gpt2():
     # -----------------------------------------------------------------------------
     # default config values designed to train a gpt2 (124M) on OpenWebText
     # I/O
-    out_dir = 'out'
-    eval_interval = 2000
-    log_interval = 1
+    out_dir = '/my_vol/gpt2_out'
+    eval_interval = 1000
+    log_interval = 10
     eval_iters = 200
     eval_only = False # if True, script exits right after the first eval
     always_save_checkpoint = True # if True, always save a checkpoint after each eval
@@ -149,7 +149,7 @@ def train_gpt2():
 
     # attempt to derive vocab_size from the dataset
     meta_path = os.path.join(data_dir, 'meta.pkl')
-    meta_vocab_size = None
+    meta_vocab_size = 4096 # from wavtokenizer
     if os.path.exists(meta_path):
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)
