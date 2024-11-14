@@ -265,8 +265,8 @@ def preprocess_get_gpt2_dataset():
         # we want to only take the first one
         ids = list(ids[0][0])
         
-        ids.append(4096) # add the end of text token ???
-        print(ids)
+        ids.append(0) # add the end of text token ???
+        # print(ids)
         out = {'ids': ids, 'len': len(ids)}
         return out
 
@@ -281,12 +281,13 @@ def preprocess_get_gpt2_dataset():
     # concatenate all the ids in each dataset into one large file we can use for training
     for split, dset in tokenized.items():
         arr_len = np.sum(dset['len'], dtype=np.uint64)
+        print("arr_len", arr_len)
         dir_name = "/my_vol/musicbench-gpt2"
         os.makedirs(dir_name, exist_ok=True)
         filename = os.path.join(dir_name, f'{split}.bin')
         dtype = np.uint16 # (can do since vocab size is 4096)
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
-        total_batches = 1024
+        total_batches = min(1024, len(dset))
 
         idx = 0
         for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
