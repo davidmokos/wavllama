@@ -7,6 +7,8 @@ import datasets  # type: ignore
 from tqdm import tqdm
 import numpy as np
 
+from model import GPTConfig, GPT
+
 
 image = modal.Image.debian_slim(python_version="3.12") \
     .pip_install_from_requirements("requirements.txt") \
@@ -44,9 +46,6 @@ def infer():
     ckpt_path = "/my_vol/gpt2_out/ckpt.pt"
     checkpoint = torch.load(ckpt_path, map_location=device)
     
-    sys.path.insert(0, "/root/WavTokenizer")
-    from model import GPTConfig, GPT
-    
     # Initialize model
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
@@ -67,7 +66,7 @@ def infer():
     max_new_tokens = 500
     temperature = 0.8
     top_k = 200
-    num_samples = 1
+    num_samples = 10
     
     # Generate tokens
     with torch.no_grad():
@@ -83,8 +82,19 @@ def infer():
                 top_k=top_k
             )
             
+            print(generated_tokens)
+            
+            print(generated_tokens.shape)
+            
+            print(f"Token range: {generated_tokens.min().item()} to {generated_tokens.max().item()}")
+            generated_tokens = torch.clamp(generated_tokens, min=0, max=4095)
+            print(f"Token range: {generated_tokens.min().item()} to {generated_tokens.max().item()}")
+            
+            
             # Convert to features using wavtokenizer
-            features = wavtokenizer.codes_to_features(generated_tokens[0])
+            features = wavtokenizer.codes_to_features(generated_tokens)
+            
+            print(features.shape)
             
             # Decode to audio
             audio_out = wavtokenizer.decode(
